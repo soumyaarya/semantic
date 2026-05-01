@@ -10,7 +10,7 @@ import os
 # ─────────────────────────────────────────────
 # PATHS
 # ─────────────────────────────────────────────
-DATA_ROOT        = "./data/imagenet100"   # Root of ImageNet-100 dataset
+DATA_ROOT        = "/kaggle/input/imagenet100"  # Root of ImageNet-100 dataset
 CHECKPOINT_DIR   = "./checkpoints"
 LOG_DIR          = "./logs"
 RESULTS_DIR      = "./results"
