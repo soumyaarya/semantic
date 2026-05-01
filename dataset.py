@@ -18,6 +18,8 @@ https://github.com/HobbitLong/CMC/blob/master/imagenet100.txt
 Then symlink the relevant class folders from your full ImageNet download.
 """
 
+import glob
+import json
 import os
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -75,6 +77,110 @@ def get_reconstruction_transform():
 # DATASET & DATALOADER BUILDERS
 # ─────────────────────────────────────────────
 
+def _find_labels_json(root: str):
+    for name in ["Labels.json", "labels.json", "label.json"]:
+        path = os.path.join(root, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _collect_image_paths(root: str, split: str):
+    """Collect image files from either standard or sharded train/val directories."""
+    paths = []
+    base_dir = os.path.join(root, split)
+    if os.path.isdir(base_dir):
+        patterns = [os.path.join(base_dir, "**", "*.JPEG"),
+                    os.path.join(base_dir, "**", "*.jpg"),
+                    os.path.join(base_dir, "**", "*.png")]
+    else:
+        patterns = []
+        for entry in os.listdir(root):
+            if entry.lower().startswith(split.lower()):
+                shard_dir = os.path.join(root, entry)
+                if os.path.isdir(shard_dir):
+                    patterns.extend([
+                        os.path.join(shard_dir, "**", "*.JPEG"),
+                        os.path.join(shard_dir, "**", "*.jpg"),
+                        os.path.join(shard_dir, "**", "*.png"),
+                    ])
+    for pattern in patterns:
+        paths.extend(glob.glob(pattern, recursive=True))
+    return sorted([p for p in paths if os.path.isfile(p)])
+
+
+def _load_label_map(labels_path: str) -> dict:
+    with open(labels_path, "r") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("Labels.json must contain a dictionary mapping image names to labels.")
+    return data
+
+
+def _normalize_key(path: str, root: str) -> str:
+    rel = os.path.relpath(path, root).replace("\\", "/")
+    rel = rel.lstrip("./")
+    return rel
+
+
+def _find_label(label_map: dict, img_path: str, root: str):
+    candidates = []
+    rel = _normalize_key(img_path, root)
+    candidates.append(rel)
+    candidates.append(os.path.basename(rel))
+    if "/" in rel:
+        candidates.append(rel.split("/", 1)[-1])
+    for key in candidates:
+        if key in label_map:
+            return label_map[key]
+    raise KeyError(
+        f"Could not find label for image path '{img_path}'. "
+        f"Tried keys: {candidates}."
+    )
+
+
+class JsonImageDataset(Dataset):
+    def __init__(self, root: str, split: str, label_map: dict, transform=None):
+        self.root = root
+        self.split = split
+        self.transform = transform
+        self.label_map = label_map
+
+        self.image_paths = _collect_image_paths(root, split)
+        if len(self.image_paths) == 0:
+            raise ValueError(
+                f"No images found for split '{split}' under root '{root}'."
+            )
+
+        self.classes = sorted(set(label_map.values()))
+        self.class_to_idx = {cls: idx for idx, cls in enumerate(self.classes)}
+
+        self.samples = []
+        for path in self.image_paths:
+            label = _find_label(label_map, path, root)
+            if label not in self.class_to_idx:
+                raise ValueError(
+                    f"Label '{label}' from Labels.json is not one of the known classes."
+                )
+            self.samples.append((path, self.class_to_idx[label]))
+
+        if len(self.classes) != C.NUM_CLASSES:
+            print(
+                f"[Warning] Labels.json defines {len(self.classes)} classes, "
+                f"expected {C.NUM_CLASSES}."
+            )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        image = datasets.folder.default_loader(path)
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+
 def get_dataloaders(batch_size: int, num_workers: int = C.NUM_WORKERS):
     """
     Returns train and val DataLoaders for ImageNet-100.
@@ -84,45 +190,60 @@ def get_dataloaders(batch_size: int, num_workers: int = C.NUM_WORKERS):
         num_workers: DataLoader worker count.
 
     Returns:
-        train_loader, val_loader, num_classes
+        train_loader, val_loader
     """
     train_dir = os.path.join(C.DATA_ROOT, "train")
-    val_dir   = os.path.join(C.DATA_ROOT, "val")
+    val_dir = os.path.join(C.DATA_ROOT, "val")
+    labels_path = _find_labels_json(C.DATA_ROOT)
 
-    assert os.path.isdir(train_dir), \
-        f"Training data not found at {train_dir}. See dataset.py docstring."
-    assert os.path.isdir(val_dir), \
-        f"Validation data not found at {val_dir}. See dataset.py docstring."
-
-    train_dataset = datasets.ImageFolder(
-        root      = train_dir,
-        transform = get_train_transform()
-    )
-    val_dataset = datasets.ImageFolder(
-        root      = val_dir,
-        transform = get_val_transform()
-    )
-
-    assert len(train_dataset.classes) == C.NUM_CLASSES, (
-        f"Expected {C.NUM_CLASSES} classes, "
-        f"found {len(train_dataset.classes)}. "
-        "Check your ImageNet-100 class folders."
-    )
+    if os.path.isdir(train_dir) and os.path.isdir(val_dir):
+        train_dataset = datasets.ImageFolder(
+            root=train_dir,
+            transform=get_train_transform()
+        )
+        val_dataset = datasets.ImageFolder(
+            root=val_dir,
+            transform=get_val_transform()
+        )
+        assert len(train_dataset.classes) == C.NUM_CLASSES, (
+            f"Expected {C.NUM_CLASSES} classes, "
+            f"found {len(train_dataset.classes)}. "
+            "Check your ImageNet-100 class folders."
+        )
+    elif labels_path is not None:
+        label_map = _load_label_map(labels_path)
+        train_dataset = JsonImageDataset(
+            root=C.DATA_ROOT,
+            split="train",
+            label_map=label_map,
+            transform=get_train_transform(),
+        )
+        val_dataset = JsonImageDataset(
+            root=C.DATA_ROOT,
+            split="val",
+            label_map=label_map,
+            transform=get_val_transform(),
+        )
+    else:
+        raise AssertionError(
+            f"Training data not found at {train_dir} and no Labels.json found in {C.DATA_ROOT}. "
+            "Please provide a dataset with standard ImageFolder layout or a label JSON file."
+        )
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size  = batch_size,
-        shuffle     = True,
-        num_workers = num_workers,
-        pin_memory  = True,
-        drop_last   = True,    # Needed for coding rate reduction batch stats
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size  = C.EVAL_BATCH,
-        shuffle     = False,
-        num_workers = num_workers,
-        pin_memory  = True,
+        batch_size=C.EVAL_BATCH,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
     )
 
     return train_loader, val_loader
