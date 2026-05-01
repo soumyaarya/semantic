@@ -85,25 +85,36 @@ def _find_labels_json(root: str):
     return None
 
 
+def _find_sharded_dirs(root: str, split: str):
+    """Return directories under root whose name starts with split, e.g. train.X1."""
+    if not os.path.isdir(root):
+        return []
+    dirs = []
+    for entry in os.listdir(root):
+        if entry.lower().startswith(split.lower()):
+            candidate = os.path.join(root, entry)
+            if os.path.isdir(candidate):
+                dirs.append(candidate)
+    return sorted(dirs)
+
+
 def _collect_image_paths(root: str, split: str):
     """Collect image files from either standard or sharded train/val directories."""
     paths = []
     base_dir = os.path.join(root, split)
+    patterns = []
     if os.path.isdir(base_dir):
         patterns = [os.path.join(base_dir, "**", "*.JPEG"),
                     os.path.join(base_dir, "**", "*.jpg"),
                     os.path.join(base_dir, "**", "*.png")]
     else:
-        patterns = []
-        for entry in os.listdir(root):
-            if entry.lower().startswith(split.lower()):
-                shard_dir = os.path.join(root, entry)
-                if os.path.isdir(shard_dir):
-                    patterns.extend([
-                        os.path.join(shard_dir, "**", "*.JPEG"),
-                        os.path.join(shard_dir, "**", "*.jpg"),
-                        os.path.join(shard_dir, "**", "*.png"),
-                    ])
+        shard_dirs = _find_sharded_dirs(root, split)
+        for shard_dir in shard_dirs:
+            patterns.extend([
+                os.path.join(shard_dir, "**", "*.JPEG"),
+                os.path.join(shard_dir, "**", "*.jpg"),
+                os.path.join(shard_dir, "**", "*.png"),
+            ])
     for pattern in patterns:
         paths.extend(glob.glob(pattern, recursive=True))
     return sorted([p for p in paths if os.path.isfile(p)])
@@ -130,6 +141,9 @@ def _find_label(label_map: dict, img_path: str, root: str):
     candidates.append(os.path.basename(rel))
     if "/" in rel:
         candidates.append(rel.split("/", 1)[-1])
+        candidates.append(rel.split("/", 2)[-1])
+    if rel.lower().endswith(".jpeg") or rel.lower().endswith(".jpg"):
+        candidates.append(os.path.splitext(os.path.basename(rel))[0])
     for key in candidates:
         if key in label_map:
             return label_map[key]
@@ -157,7 +171,13 @@ class JsonImageDataset(Dataset):
 
         self.samples = []
         for path in self.image_paths:
-            label = _find_label(label_map, path, root)
+            try:
+                label = _find_label(label_map, path, root)
+            except KeyError as e:
+                raise KeyError(
+                    f"Could not assign a label for '{path}'. "
+                    f"Make sure Labels.json keys match image filenames or relative paths.\n{e}"
+                )
             if label not in self.class_to_idx:
                 raise ValueError(
                     f"Label '{label}' from Labels.json is not one of the known classes."
@@ -196,6 +216,9 @@ def get_dataloaders(batch_size: int, num_workers: int = C.NUM_WORKERS):
     val_dir = os.path.join(C.DATA_ROOT, "val")
     labels_path = _find_labels_json(C.DATA_ROOT)
 
+    sharded_train_dirs = _find_sharded_dirs(C.DATA_ROOT, "train")
+    sharded_val_dirs = _find_sharded_dirs(C.DATA_ROOT, "val")
+
     if os.path.isdir(train_dir) and os.path.isdir(val_dir):
         train_dataset = datasets.ImageFolder(
             root=train_dir,
@@ -210,6 +233,49 @@ def get_dataloaders(batch_size: int, num_workers: int = C.NUM_WORKERS):
             f"found {len(train_dataset.classes)}. "
             "Check your ImageNet-100 class folders."
         )
+    elif sharded_train_dirs and sharded_val_dirs:
+        from torchvision.datasets.folder import default_loader
+
+        class ShardedImageFolderDataset(Dataset):
+            def __init__(self, roots, transform=None):
+                self.roots = roots
+                self.transform = transform
+                self.samples = []
+                classes = set()
+                for root_dir in roots:
+                    for class_name in sorted(os.listdir(root_dir)):
+                        class_path = os.path.join(root_dir, class_name)
+                        if os.path.isdir(class_path):
+                            classes.add(class_name)
+                self.classes = sorted(classes)
+                self.class_to_idx = {cls: idx for idx, cls in enumerate(self.classes)}
+                for root_dir in roots:
+                    for class_name in self.classes:
+                        class_path = os.path.join(root_dir, class_name)
+                        if not os.path.isdir(class_path):
+                            continue
+                        for ext in ["*.JPEG", "*.jpg", "*.png"]:
+                            for img_path in glob.glob(os.path.join(class_path, "**", ext), recursive=True):
+                                if os.path.isfile(img_path):
+                                    self.samples.append((img_path, self.class_to_idx[class_name]))
+                if len(self.classes) != C.NUM_CLASSES:
+                    print(
+                        f"[Warning] Found {len(self.classes)} classes in sharded folders, "
+                        f"expected {C.NUM_CLASSES}."
+                    )
+
+            def __len__(self):
+                return len(self.samples)
+
+            def __getitem__(self, idx):
+                path, label = self.samples[idx]
+                image = default_loader(path)
+                if self.transform:
+                    image = self.transform(image)
+                return image, label
+
+        train_dataset = ShardedImageFolderDataset(sharded_train_dirs, transform=get_train_transform())
+        val_dataset = ShardedImageFolderDataset(sharded_val_dirs, transform=get_val_transform())
     elif labels_path is not None:
         label_map = _load_label_map(labels_path)
         train_dataset = JsonImageDataset(
