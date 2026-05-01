@@ -82,6 +82,14 @@ def _find_labels_json(root: str):
         path = os.path.join(root, name)
         if os.path.isfile(path):
             return path
+    # Search one level deeper if the root contains a single folder
+    for entry in sorted(os.listdir(root)):
+        child = os.path.join(root, entry)
+        if os.path.isdir(child):
+            for name in ["Labels.json", "labels.json", "label.json"]:
+                path = os.path.join(child, name)
+                if os.path.isfile(path):
+                    return path
     return None
 
 
@@ -201,6 +209,28 @@ class JsonImageDataset(Dataset):
         return image, label
 
 
+def _has_dataset_root(root: str):
+    if not os.path.isdir(root):
+        return False
+    if os.path.isdir(os.path.join(root, "train")) and os.path.isdir(os.path.join(root, "val")):
+        return True
+    if _find_sharded_dirs(root, "train") and _find_sharded_dirs(root, "val"):
+        return True
+    if _find_labels_json(root) is not None:
+        return True
+    return False
+
+
+def _resolve_data_root(root: str):
+    if _has_dataset_root(root):
+        return root
+    for entry in sorted(os.listdir(root)):
+        candidate = os.path.join(root, entry)
+        if _has_dataset_root(candidate):
+            return candidate
+    return root
+
+
 def get_dataloaders(batch_size: int, num_workers: int = C.NUM_WORKERS):
     """
     Returns train and val DataLoaders for ImageNet-100.
@@ -212,12 +242,13 @@ def get_dataloaders(batch_size: int, num_workers: int = C.NUM_WORKERS):
     Returns:
         train_loader, val_loader
     """
-    train_dir = os.path.join(C.DATA_ROOT, "train")
-    val_dir = os.path.join(C.DATA_ROOT, "val")
-    labels_path = _find_labels_json(C.DATA_ROOT)
+    data_root = _resolve_data_root(C.DATA_ROOT)
+    train_dir = os.path.join(data_root, "train")
+    val_dir = os.path.join(data_root, "val")
+    labels_path = _find_labels_json(data_root)
 
-    sharded_train_dirs = _find_sharded_dirs(C.DATA_ROOT, "train")
-    sharded_val_dirs = _find_sharded_dirs(C.DATA_ROOT, "val")
+    sharded_train_dirs = _find_sharded_dirs(data_root, "train")
+    sharded_val_dirs = _find_sharded_dirs(data_root, "val")
 
     if os.path.isdir(train_dir) and os.path.isdir(val_dir):
         train_dataset = datasets.ImageFolder(
